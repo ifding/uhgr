@@ -2,12 +2,104 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 import torch.nn.functional as F
-
 import numpy as np
 
-from set2set import Set2Set
+from modules import Discriminator
 
-from dgi import Discriminator
+
+# GAT basic operation
+class GAT(nn.Module):
+    def __init__(self, input_dim, output_dim, add_self=False, normalize_embedding=False,
+            dropout=0.0, bias=True):
+        super(GAT, self).__init__()
+
+        self.dropout = dropout
+        if dropout > 0.001:
+            self.dropout_layer = nn.Dropout(p=dropout)
+
+        self.alpha = 0.2
+        self.in_features = input_dim
+        self.out_features = output_dim
+        self.W = nn.Parameter(nn.init.xavier_normal_(torch.Tensor(self.in_features,self.out_features).type(
+            torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor), 
+            gain=np.sqrt(2.0)), requires_grad=True)
+        self.a1 = nn.Parameter(nn.init.xavier_normal_(torch.Tensor(self.out_features, 1).type(
+            torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor),
+            gain=np.sqrt(2.0)), requires_grad=True)
+        self.a2 = nn.Parameter(nn.init.xavier_normal_(torch.Tensor(self.out_features, 1).type(
+            torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor),
+            gain=np.sqrt(2.0)), requires_grad=True)
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+        self.concat = True
+  
+    def forward(self, x, adj):
+
+        ''' Perform forward prop with graph convolution.
+        Returns:
+            Embedding matrix with dimension [batch_size x num_nodes x embedding]
+        '''
+        N, L, D = x.size()
+        
+        #print(x.shape)
+        
+        #print(adj.shape)        
+
+        h = torch.mm(x.view(-1, D), self.W).view(N, L, -1)        
+        f_1 = torch.matmul(h, self.a1)
+        f_2 = torch.matmul(h, self.a2)
+        e = self.leakyrelu(f_1 + f_2.transpose(1,2))  
+        zero_vec = -9e15*torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=2)
+        #attention = F.dropout(attention, self.dropout, training=self.training)
+        h_prime = torch.matmul(attention, h)
+        
+        if self.concat:
+            return F.elu(h_prime)
+        else:
+            return h_prime        
+
+        #print(h.shape)
+        #exit()        
+        
+        return h_prime    
+
+    
+class GCN(nn.Module):
+    def __init__(self, input_dim, output_dim, add_self=False, normalize_embedding=False,
+            dropout=0.0, bias=True):
+        super(GCN, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim, bias=False)
+        self.act = nn.PReLU()
+        
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(output_dim))
+            self.bias.data.fill_(0.0)
+        else:
+            self.register_parameter('bias', None)
+
+        for m in self.modules():
+            self.weights_init(m)
+
+    def weights_init(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight.data)
+            if m.bias is not None:
+                m.bias.data.fill_(0.0)
+
+    # Shape of seq: (batch, nodes, features)
+    def forward(self, seq, adj, sparse=False):
+        seq_fts = self.fc(seq)
+        if sparse:
+            out = torch.unsqueeze(torch.spmm(adj, torch.squeeze(seq_fts, 0)), 0)
+        else:
+            out = torch.bmm(adj, seq_fts)
+        if self.bias is not None:
+            out += self.bias
+        
+        return self.act(out)
+    
+    
 
 # GCN basic operation
 class GraphConv(nn.Module):
@@ -45,7 +137,7 @@ class GraphConv(nn.Module):
         
         
         
-    def forward(self, x, adj):
+    def _forward(self, x, adj):
 
         ''' Perform forward prop with graph convolution.
         Returns:
@@ -81,28 +173,35 @@ class GraphConv(nn.Module):
         
         
 
-    def _forward(self, x, adj):
-        
-        print(x.shape)
-        
-        print(adj.shape)
+    def forward(self, x, adj):
         
         if self.dropout > 0.001:
             x = self.dropout_layer(x)
+        
+        
+        #print(adj.shape)
+        #print(x.shape)
+            
+        #x = torch.squeeze(x, 0)        
+        #y = torch.sparse.mm(adj, x)
+        #y = y.unsqueeze(0)
+        
+        
+            
         y = torch.matmul(adj, x)
+        
+        #print(y.shape)
+        
         if self.add_self:
             y += x
-        y = torch.matmul(y,self.weight)
+            
+        y = torch.matmul(y, self.weight)
         if self.bias is not None:
             y = y + self.bias
+                        
         if self.normalize_embedding:
             y = F.normalize(y, p=2, dim=2)
-            #print(y[0][0])
-            
-        
-        print(y.shape)
-        exit()
-        
+
         return y
     
 
@@ -141,14 +240,14 @@ class _GraphConv(nn.Module):
     
 
 class GcnEncoderGraph(nn.Module):
-    def __init__(self, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
+    def __init__(self, conv_layers, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
             pred_hidden_dims=[], concat=True, bn=True, dropout=0.0, args=None):
         super(GcnEncoderGraph, self).__init__()
         self.concat = concat
         add_self = not concat
         self.bn = bn
         self.num_layers = num_layers
-        self.num_aggs=1
+        self.num_aggs=1        
         
         self.sigm = nn.Sigmoid()
         self.disc = Discriminator(hidden_dim*3)
@@ -160,7 +259,7 @@ class GcnEncoderGraph(nn.Module):
             self.bias = args.bias
 
         self.conv_first, self.conv_block, self.conv_last = self.build_conv_layers(
-                input_dim, hidden_dim, embedding_dim, num_layers, 
+                conv_layers, input_dim, hidden_dim, embedding_dim, num_layers, 
                 add_self, normalize=True, dropout=dropout)
         self.act = nn.ReLU()
         self.label_dim = label_dim
@@ -174,20 +273,24 @@ class GcnEncoderGraph(nn.Module):
 
         for m in self.modules():
             if isinstance(m, GraphConv):
-                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
                 if m.bias is not None:
-                    m.bias.data = init.constant(m.bias.data, 0.0)
+                    m.bias.data = init.constant_(m.bias.data, 0.0)
                     
 
-    def build_conv_layers(self, input_dim, hidden_dim, embedding_dim, num_layers, add_self,
-            normalize=False, dropout=0.0):
-        conv_first = GraphConv(input_dim=input_dim, output_dim=hidden_dim, add_self=add_self,
-                normalize_embedding=normalize, bias=self.bias)
+    def build_conv_layers(self, conv_layers, input_dim, hidden_dim, embedding_dim, num_layers, 
+            add_self, normalize=False, dropout=0.0):
+        if conv_layers == 'GAT':
+            conv_first = GAT(input_dim=input_dim, output_dim=hidden_dim, add_self=add_self,
+                    normalize_embedding=normalize, bias=self.bias)
+        else:
+            conv_first = GCN(input_dim=input_dim, output_dim=hidden_dim, add_self=add_self,
+                    normalize_embedding=normalize, bias=self.bias)            
         conv_block = nn.ModuleList(
-                [GraphConv(input_dim=hidden_dim, output_dim=hidden_dim, add_self=add_self,
+                [GCN(input_dim=hidden_dim, output_dim=hidden_dim, add_self=add_self,
                         normalize_embedding=normalize, dropout=dropout, bias=self.bias) 
                  for i in range(num_layers-2)])
-        conv_last = GraphConv(input_dim=hidden_dim, output_dim=embedding_dim, add_self=add_self,
+        conv_last = GCN(input_dim=hidden_dim, output_dim=embedding_dim, add_self=add_self,
                 normalize_embedding=normalize, bias=self.bias)
         return conv_first, conv_block, conv_last
 
@@ -310,106 +413,8 @@ class GcnEncoderGraph(nn.Module):
         #return F.binary_cross_entropy(F.sigmoid(pred[:,0]), label.float())
 
 
-class GcnSet2SetEncoder(GcnEncoderGraph):
-    def __init__(self, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
-            pred_hidden_dims=[], concat=True, bn=True, dropout=0.0, args=None):
-        super(GcnSet2SetEncoder, self).__init__(input_dim, hidden_dim, embedding_dim, label_dim,
-                num_layers, pred_hidden_dims, concat, bn, dropout, args=args)
-        self.s2s = Set2Set(self.pred_input_dim, self.pred_input_dim * 2)
-        
-    def readout(self, x, adj, shuf_fts, batch_num_nodes, **kwargs): 
-        
-        # mask
-        max_num_nodes = adj.size()[1]
-        if batch_num_nodes is not None:
-            embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
-        else:
-            embedding_mask = None
-
-        origin_embedding_tensor = self.gcn_forward(x, adj,
-                self.conv_first, self.conv_block, self.conv_last, embedding_mask)
-        
-        shuf_embedding_tensor = self.gcn_forward(shuf_fts, adj,
-                self.conv_first, self.conv_block, self.conv_last, embedding_mask) 
-        
-        out = self.s2s(origin_embedding_tensor) 
-        
-        return out, origin_embedding_tensor, shuf_embedding_tensor
-        
-    
-    def embed(self, x, adj, shuf_fts, batch_num_nodes, **kwargs):
-        if 'assign_x' in kwargs:
-            x_a = kwargs['assign_x']
-        else:
-            x_a = x
-
-        c, origin_embedding_tensor, shuf_embedding_tensor = self.readout(x, adj, shuf_fts, batch_num_nodes)
-        
-        return origin_embedding_tensor.detach(), c.detach()
-    
-    
-    def compute_loss(self, all_loss_output, batch_num_nodes, max_num_nodes):
-        
-        loss = torch.zeros(1) 
-        total = torch.FloatTensor([np.sum(batch_num_nodes)])
-        if torch.cuda.is_available():
-            loss = loss.cuda()
-            total = total.cuda()
-        
-        for loss_output, num_nodes in zip(all_loss_output, batch_num_nodes):
-            loss += torch.sum(loss_output[:num_nodes])
-            loss += torch.sum(loss_output[max_num_nodes:max_num_nodes+num_nodes])
-
-        return loss/total    
-
-    def forward(self, x, adj, shuf_fts, batch_num_nodes, **kwargs):    
-        ## mask
-        #max_num_nodes = adj.size()[1]
-        #if batch_num_nodes is not None:
-        #    embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
-        #else:
-        #    embedding_mask = None
-#
-        #origin_embedding_tensor = self.gcn_forward(x, adj,
-        #        self.conv_first, self.conv_block, self.conv_last, embedding_mask)
-        #
-        #shuf_embedding_tensor = self.gcn_forward(shuf_fts, adj,
-        #        self.conv_first, self.conv_block, self.conv_last, embedding_mask) 
-        #
-        #output = self.s2s(origin_embedding_tensor)
-        
-        c, origin_embedding_tensor, shuf_embedding_tensor = self.readout(x, adj, shuf_fts, batch_num_nodes)
-        
-        c = self.sigm(c)
-        
-        logits = self.disc(c, origin_embedding_tensor, shuf_embedding_tensor)
-        
-        batch_size = adj.size()[0]
-        
-        max_num_nodes = adj.size()[1]
-        
-        lbl_1 = torch.ones(batch_size, max_num_nodes)
-        
-        lbl_2 = torch.zeros(batch_size, max_num_nodes)
-        
-        lbl = torch.cat((lbl_1, lbl_2), 1)
-        
-        if torch.cuda.is_available():
-            lbl = lbl.cuda()    
- 
-        all_loss_output = self.b_xent(logits, lbl)
-        
-        loss = self.compute_loss(all_loss_output, batch_num_nodes, max_num_nodes)
-        
-        return loss
-        
-        #out, _ = torch.max(embedding_tensor, dim=1)
-        #ypred = self.pred_model(out)
-        #return ypred
-
-
 class SoftPoolingGcnEncoder(GcnEncoderGraph):
-    def __init__(self, max_num_nodes, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
+    def __init__(self, conv_layers, max_num_nodes, input_dim, hidden_dim, embedding_dim, label_dim, num_layers,
             assign_hidden_dim, assign_ratio=0.25, assign_num_layers=-1, num_pooling=1,
             pred_hidden_dims=[50], concat=True, bn=True, dropout=0.0, linkpred=True,
             assign_input_dim=-1, args=None):
@@ -420,13 +425,13 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
             linkpred: flag to turn on link prediction side objective
         '''
 
-        super(SoftPoolingGcnEncoder, self).__init__(input_dim, hidden_dim, embedding_dim, label_dim,
+        super(SoftPoolingGcnEncoder, self).__init__(conv_layers, input_dim, hidden_dim, embedding_dim, label_dim,
                 num_layers, pred_hidden_dims=pred_hidden_dims, concat=concat, args=args)
         add_self = not concat
         self.num_pooling = num_pooling
         self.linkpred = linkpred
         self.assign_ent = True
-        
+
         # GC
         self.conv_first_after_pool = []
         self.conv_block_after_pool = []
@@ -434,7 +439,7 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         for i in range(num_pooling):
             # use self to register the modules in self.modules()
             self.conv_first2, self.conv_block2, self.conv_last2 = self.build_conv_layers(
-                    self.pred_input_dim, hidden_dim, embedding_dim, num_layers, 
+                    conv_layers, self.pred_input_dim, hidden_dim, embedding_dim, num_layers, 
                     add_self, normalize=True, dropout=dropout)
             self.conv_first_after_pool.append(self.conv_first2)
             self.conv_block_after_pool.append(self.conv_block2)
@@ -455,7 +460,7 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         for i in range(num_pooling):
             assign_dims.append(assign_dim)
             self.assign_conv_first, self.assign_conv_block, self.assign_conv_last = self.build_conv_layers(
-                    assign_input_dim, assign_hidden_dim, assign_dim, assign_num_layers, add_self,
+                    conv_layers, assign_input_dim, assign_hidden_dim, assign_dim, assign_num_layers, add_self,
                     normalize=True)
             assign_pred_input_dim = assign_hidden_dim * (num_layers - 1) + assign_dim if concat else assign_dim
             self.assign_pred = self.build_pred_layers(assign_pred_input_dim, [], assign_dim, num_aggs=1)
@@ -475,9 +480,9 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
 
         for m in self.modules():
             if isinstance(m, GraphConv):
-                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
                 if m.bias is not None:
-                    m.bias.data = init.constant(m.bias.data, 0.0)
+                    m.bias.data = init.constant_(m.bias.data, 0.0)
 
     def readout(self, x, adj, shuf_fts, batch_num_nodes, x_a):
 
@@ -552,7 +557,10 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         if self.concat:
             output = torch.cat(out_all, dim=1)
         else:
-            output = out   
+            output = out 
+            
+        
+        #output = torch.mean(origin_embedding_tensor, 1)
             
         return output, origin_embedding_tensor, shuf_embedding_tensor, origin_embedding_mask
     
@@ -565,6 +573,7 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         c, origin_embedding_tensor, shuf_embedding_tensor, _ = self.readout(x, adj, shuf_fts, batch_num_nodes, x_a)
         
         c = self.sigm(c)
+        
         
         logits = self.disc(c, origin_embedding_tensor, shuf_embedding_tensor)
         
@@ -587,7 +596,6 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         
         #print(logits.shape)
         #print(lbl.shape)
-        
 
         all_loss_output = self.b_xent(logits, lbl)
         

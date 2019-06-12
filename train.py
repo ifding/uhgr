@@ -1,5 +1,5 @@
 import matplotlib
-import matplotlib.colors as colors
+#import matplotlib.colors as colors
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -9,6 +9,7 @@ import sklearn.metrics as metrics
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+import tensorboardX
 from tensorboardX import SummaryWriter
 
 import argparse
@@ -17,16 +18,16 @@ import pickle
 import random
 import shutil
 import time
+import scipy.sparse as sp
 
-import cross_val
 import encoders
 import gen.feat as featgen
 import gen.data as datagen
-from graph_sampler import GraphSampler
-import load_data
+
+import process
 import util
 
-from dgi import Classifier
+from modules import Classifier, LogReg
 
 
 def evaluate(dataset, model, classifier, args, name='Validation', max_num_examples=None):
@@ -67,14 +68,14 @@ def gen_prefix(args):
         name = args.bmname
     else:
         name = args.dataset
-    name += '_' + args.method
-    if args.method == 'soft-assign':
-        name += '_l' + str(args.num_gc_layers) + 'x' + str(args.num_pool)
-        name += '_ar' + str(int(args.assign_ratio*100))
-        if args.linkpred:
-            name += '_lp'
-    else:
-        name += '_l' + str(args.num_gc_layers)
+        
+    name += '_' + args.task + '-task'   
+    name += '_' + args.encoder
+    name += '_l' + str(args.num_gc_layers) + 'x' + str(args.num_pool)
+    name += '_ar' + str(int(args.assign_ratio*100))
+    if args.linkpred:
+        name += '_lp'
+
     name += '_h' + str(args.hidden_dim) + '_o' + str(args.output_dim)
     if not args.bias:
         name += '_nobias'
@@ -82,8 +83,6 @@ def gen_prefix(args):
         name += '_' + args.name_suffix
     return name
 
-def gen_train_plt_name(args):
-    return 'results/' + gen_prefix(args) + '.png'
 
 def log_assignment(assign_tensor, writer, epoch, batch_idx):
     plt.switch_backend('agg')
@@ -98,8 +97,10 @@ def log_assignment(assign_tensor, writer, epoch, batch_idx):
     plt.tight_layout()
     fig.canvas.draw()
 
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    #data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    #data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    
+    data = tensorboardX.utils.figure_to_image(fig)
     writer.add_image('assignment', data, epoch)
 
 def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None):
@@ -119,27 +120,11 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
     plt.tight_layout()
     fig.canvas.draw()
 
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    writer.add_image('graphs', data, epoch)
-
-    # log a label-less version
-    #fig = plt.figure(figsize=(8,6), dpi=300)
-    #for i in range(len(batch_idx)):
-    #    ax = plt.subplot(2, 2, i+1)
-    #    num_nodes = batch_num_nodes[batch_idx[i]]
-    #    adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().data.numpy()
-    #    G = nx.from_numpy_matrix(adj_matrix)
-    #    nx.draw(G, pos=nx.spring_layout(G), with_labels=False, node_color='#336699',
-    #            edge_color='grey', width=0.5, node_size=25,
-    #            alpha=0.8)
-
-    #plt.tight_layout()
-    #fig.canvas.draw()
-
     #data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
     #data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    #writer.add_image('graphs_no_label', data, epoch)
+    
+    data = tensorboardX.utils.figure_to_image(fig)
+    writer.add_image('graphs', data, epoch)
 
     # colored according to assignment
     assignment = assign_tensor.cpu().data.numpy()
@@ -166,13 +151,173 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
     plt.tight_layout()
     fig.canvas.draw()
 
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    #data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    #data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    
+    data = tensorboardX.utils.figure_to_image(fig)
     writer.add_image('graphs_colored', data, epoch)
 
 
-def train(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=None, writer=None,
-        mask_nodes = True):
+
+def train_node_task(adj, features, model, args, labels, dataset_idx, writer=None, mask_nodes = True):
+    
+    writer_batch_idx = [0, 3, 6, 9]
+    
+    # training params
+    batch_size = 1
+    nb_epochs = 10000
+    patience = 40
+    lr = 0.001
+    l2_coef = 0.0
+    drop_prob = 0.0
+    hid_units = 512
+    sparse = True
+    nonlinearity = 'prelu' # special name to separate parameters 
+    best = 1e9
+    
+    
+    nb_classes = labels.shape[1]
+    
+    idx_train, idx_val, idx_test = dataset_idx[0], dataset_idx[1], dataset_idx[2]
+    labels = torch.FloatTensor(labels[np.newaxis]).cuda()
+    idx_train = torch.LongTensor(idx_train).cuda()
+    idx_val = torch.LongTensor(idx_val).cuda()
+    idx_test = torch.LongTensor(idx_test).cuda()      
+    
+    b_xent = nn.BCEWithLogitsLoss()
+    xent = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(filter(lambda p : p.requires_grad, model.parameters()), lr=0.001)
+    
+    nb_nodes = adj.shape[0]  
+    adj = process.normalize_adj(adj + sp.eye(adj.shape[0]))           
+    adj = (adj + sp.eye(adj.shape[0])).todense()
+    adj = torch.FloatTensor(adj[np.newaxis])
+    features = torch.FloatTensor(features[np.newaxis])
+    idx = np.random.permutation(nb_nodes)
+    shuf_fts = features[:, idx, :]
+
+    if torch.cuda.is_available():
+        print('Using CUDA')
+        adj = adj.cuda()
+        features = features.cuda()
+        shuf_fts = shuf_fts.cuda()
+        labels = labels.cuda()
+        idx_train = idx_train.cuda()
+        idx_val = idx_val.cuda()
+        idx_test = idx_test.cuda()
+
+    batch_num_nodes = np.array([nb_nodes])    
+    
+
+    cnt_wait = 0
+    best_t = 0    
+    for epoch in range(args.num_epochs):
+        
+        print('Epoch: ', epoch)        
+        avg_loss = 0.0
+        begin_time = time.time()
+        
+        model.train()     
+        optimizer.zero_grad()
+        loss = model(features, adj, shuf_fts, batch_num_nodes)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        optimizer.step()
+
+        avg_loss = loss
+
+        elapsed = time.time() - begin_time
+        if writer is not None:
+            writer.add_scalar('loss/avg_loss', avg_loss, epoch)
+            if args.linkpred:
+                writer.add_scalar('loss/linkpred_loss', model.link_loss, epoch)
+        print('Loss: ', avg_loss, '; epoch time: ', elapsed)
+        
+        if avg_loss < best:
+            best = avg_loss
+            best_t = epoch
+            cnt_wait = 0
+            torch.save(model.state_dict(), 'best_dgi.pkl')
+        else:
+            cnt_wait += 1
+
+        if cnt_wait == patience:
+            print('Early stopping!')
+            break
+           
+    print('Loading {}th epoch'.format(best_t))
+    model.load_state_dict(torch.load('best_dgi.pkl')) 
+
+
+    log = LogReg(args.hidden_dim*3, nb_classes)
+    xent = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(log.parameters(), lr=0.01, weight_decay=0.0)
+    log.cuda() 
+    
+
+    best_val_result = {
+            'epoch': 0,
+            'acc': 0}
+    test_result = {
+            'epoch': 0,
+            'acc': 0}
+    train_accs = []
+    train_epochs = []
+    best_val_accs = []
+    best_val_epochs = []
+    test_accs = []
+    test_epochs = []
+    val_accs = []   
+    
+    
+    for epoch in range(args.num_epochs):
+        
+        print('Epoch: ', epoch)
+        
+        begin_time = time.time()
+
+        node_embeds, _  = model.embed(features, adj, shuf_fts, batch_num_nodes)
+
+        train_embs = node_embeds[0, idx_train]
+        val_embs = node_embeds[0, idx_val]
+        test_embs = node_embeds[0, idx_test]
+
+        train_lbls = torch.argmax(labels[0, idx_train], dim=1)
+        val_lbls = torch.argmax(labels[0, idx_val], dim=1)
+        test_lbls = torch.argmax(labels[0, idx_test], dim=1)
+
+        for _ in range(100):
+            log.train()
+            opt.zero_grad()
+            logits = log(train_embs)
+
+            loss = xent(logits, train_lbls)
+
+            loss.backward()
+            opt.step() 
+
+        logits = log(val_embs)
+        preds = torch.argmax(logits, dim=1)
+        acc = torch.sum(preds == val_lbls).float() / val_lbls.shape[0]
+        elapsed = time.time() - begin_time
+        print('Val acc: ', acc.item(), '; epoch time: ', elapsed)
+
+        if acc > best_val_result['acc'] - 1e-7:
+            best_val_result['acc'] = acc.item()
+            best_val_result['epoch'] = epoch
+            
+            logits = log(test_embs)
+            preds = torch.argmax(logits, dim=1)
+            acc = torch.sum(preds == test_lbls).float() / test_lbls.shape[0]
+            
+            test_result['acc'] = acc.item()
+            test_result['epoch'] = epoch
+    
+    return test_result      
+
+
+def train_graph_task(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=None, writer=None,
+        mask_nodes = True):    
     writer_batch_idx = [0, 3, 6, 9]
     
     optimizer = torch.optim.Adam(filter(lambda p : p.requires_grad, model.parameters()), lr=0.001)
@@ -200,21 +345,14 @@ def train(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=N
             
             loss = model(h0, adj, shuf_fts, batch_num_nodes, assign_x=assign_input)
 
-            #ypred = model(h0, adj, shuf_fts, batch_num_nodes, assign_x=assign_input)
-            #if not args.method == 'soft-assign' or not args.linkpred:
-            #    loss = model.loss(ypred, label)
-            #else:
-            #    loss = model.loss(ypred, label, adj, batch_num_nodes)
             loss.backward()
-            nn.utils.clip_grad_norm(model.parameters(), args.clip)
+            nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             optimizer.step()
             iter += 1
             avg_loss += loss
-            #if iter % 20 == 0:
-            #    print('Iter: ', iter, ', loss: ', loss.data[0])
 
             # log once per XX epochs
-            if epoch % 10 == 0 and batch_idx == len(dataset) // 2 and args.method == 'soft-assign' and writer is not None:
+            if epoch % 10 == 0 and batch_idx == len(dataset) // 2 and writer is not None:
                 log_assignment(model.assign_tensor, writer, epoch, writer_batch_idx)
                 log_graph(adj, batch_num_nodes, writer, epoch, writer_batch_idx, model.assign_tensor)
         avg_loss /= batch_idx + 1
@@ -237,14 +375,12 @@ def train(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=N
         if cnt_wait == patience:
             print('Early stopping!')
             break
-        
-         
+                
     print('Loading {}th epoch'.format(best_t))
     model.load_state_dict(torch.load('best_dgi.pkl')) 
     
-        
-    #classifier = Classifier(120, [], 2)
-    classifier = Classifier(120, [], args.num_classes)
+       
+    classifier = Classifier(args.hidden_dim*3, [], args.num_classes)
     xent = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(classifier.parameters(), lr=0.01, weight_decay=0.0)
     classifier.cuda() 
@@ -280,7 +416,7 @@ def train(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=N
             
             _, embeds  = model.embed(h0, adj, shuf_fts, batch_num_nodes, assign_x=assign_input)    
             logits = classifier(embeds)
-           
+
             loss = xent(logits, label)
             loss.backward()
             nn.utils.clip_grad_norm(model.parameters(), args.clip)
@@ -301,244 +437,58 @@ def train(dataset, model, args, same_feat=True, val_dataset=None, test_dataset=N
             best_val_result['acc'] = val_result['acc']
             best_val_result['epoch'] = epoch
             best_val_result['loss'] = avg_loss
-        if test_dataset is not None:
-            test_result = evaluate(test_dataset, model, classifier, args, name='Test')
-            test_result['epoch'] = epoch
         if writer is not None:
             writer.add_scalar('acc/train_acc', result['acc'], epoch)
             writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
             writer.add_scalar('loss/best_val_loss', best_val_result['loss'], epoch)
-            if test_dataset is not None:
-                writer.add_scalar('acc/test_acc', test_result['acc'], epoch)
 
         print('Best val result: ', best_val_result)
         best_val_epochs.append(best_val_result['epoch'])
         best_val_accs.append(best_val_result['acc'])
-        if test_dataset is not None:
-            print('Test result: ', test_result)
-            test_epochs.append(test_result['epoch'])
-            test_accs.append(test_result['acc'])
                 
 
     matplotlib.style.use('seaborn')
     plt.switch_backend('agg')
     plt.figure()
     plt.plot(train_epochs, util.exp_moving_avg(train_accs, 0.85), '-', lw=1)
-    if test_dataset is not None:
-        plt.plot(best_val_epochs, best_val_accs, 'bo', test_epochs, test_accs, 'go')
-        plt.legend(['train', 'val', 'test'])
-    else:
-        plt.plot(best_val_epochs, best_val_accs, 'bo')
-        plt.legend(['train', 'val'])
-    plt.savefig(gen_train_plt_name(args), dpi=600)
+    
+    plt.plot(best_val_epochs, best_val_accs, 'bo')
+    plt.legend(['train', 'val'])
+    
+    train_plt_name = 'results/' + gen_prefix(args) + '.png'
+    plt.savefig(train_plt_name, dpi=600)
     plt.close()
     matplotlib.style.use('default')
 
-    return model, val_accs
+    return val_accs
 
-def prepare_data(graphs, args, test_graphs=None, max_nodes=0):
+def node_benchmark_task(args, writer=None):
+    all_vals = []
 
-    random.shuffle(graphs)
-    if test_graphs is None:
-        train_idx = int(len(graphs) * args.train_ratio)
-        test_idx = int(len(graphs) * (1-args.test_ratio))
-        train_graphs = graphs[:train_idx]
-        val_graphs = graphs[train_idx: test_idx]
-        test_graphs = graphs[test_idx:]
-    else:
-        train_idx = int(len(graphs) * args.train_ratio)
-        train_graphs = graphs[:train_idx]
-        val_graphs = graph[train_idx:]
-    print('Num training graphs: ', len(train_graphs), 
-          '; Num validation graphs: ', len(val_graphs),
-          '; Num testing graphs: ', len(test_graphs))
+    adj, features, labels, dataset_idx = process.read_graph(args.bmname)
+    max_num_nodes = features.shape[0]   
+    input_dim = features.shape[1]
 
-    print('Number of graphs: ', len(graphs))
-    print('Number of edges: ', sum([G.number_of_edges() for G in graphs]))
-    print('Max, avg, std of graph size: ', 
-            max([G.number_of_nodes() for G in graphs]), ', '
-            "{0:.2f}".format(np.mean([G.number_of_nodes() for G in graphs])), ', '
-            "{0:.2f}".format(np.std([G.number_of_nodes() for G in graphs])))
+    model = encoders.SoftPoolingGcnEncoder(
+            args.encoder,               
+            max_num_nodes, 
+            input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
+            args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
+            bn=args.bn, dropout=args.dropout, linkpred=args.linkpred, args=args,
+            assign_input_dim=input_dim).cuda()
 
-    # minibatch
-    dataset_sampler = GraphSampler(train_graphs, normalize=False, max_num_nodes=max_nodes,
-            features=args.feature_type)
-    train_dataset_loader = torch.utils.data.DataLoader(
-            dataset_sampler, 
-            batch_size=args.batch_size, 
-            shuffle=True,
-            num_workers=args.num_workers)
-
-    dataset_sampler = GraphSampler(val_graphs, normalize=False, max_num_nodes=max_nodes,
-            features=args.feature_type)
-    val_dataset_loader = torch.utils.data.DataLoader(
-            dataset_sampler, 
-            batch_size=args.batch_size, 
-            shuffle=False,
-            num_workers=args.num_workers)
-
-    dataset_sampler = GraphSampler(test_graphs, normalize=False, max_num_nodes=max_nodes,
-            features=args.feature_type)
-    test_dataset_loader = torch.utils.data.DataLoader(
-            dataset_sampler, 
-            batch_size=args.batch_size, 
-            shuffle=False,
-            num_workers=args.num_workers)
-
-    return train_dataset_loader, val_dataset_loader, test_dataset_loader, \
-            dataset_sampler.max_num_nodes, dataset_sampler.feat_dim, dataset_sampler.assign_feat_dim
-
-def syn_community1v2(args, writer=None, export_graphs=False):
-
-    # data
-    graphs1 = datagen.gen_ba(range(40, 60), range(4, 5), 500, 
-            featgen.ConstFeatureGen(np.ones(args.input_dim, dtype=float)))
-    for G in graphs1:
-        G.graph['label'] = 0
-    if export_graphs:
-        util.draw_graph_list(graphs1[:16], 4, 4, 'figs/ba')
-
-    graphs2 = datagen.gen_2community_ba(range(20, 30), range(4, 5), 500, 0.3, 
-            [featgen.ConstFeatureGen(np.ones(args.input_dim, dtype=float))])
-    for G in graphs2:
-        G.graph['label'] = 1
-    if export_graphs:
-        util.draw_graph_list(graphs2[:16], 4, 4, 'figs/ba2')
-
-    graphs = graphs1 + graphs2
-    
-    train_dataset, val_dataset, test_dataset, max_num_nodes, input_dim, assign_input_dim = prepare_data(graphs, args)
-    if args.method == 'soft-assign':
-        print('Method: soft-assign')
-        model = encoders.SoftPoolingGcnEncoder(
-                max_num_nodes, 
-                input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
-                args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
-                bn=args.bn, linkpred=args.linkpred, assign_input_dim=assign_input_dim).cuda()
-    elif args.method == 'base-set2set':
-        print('Method: base-set2set')
-        model = encoders.GcnSet2SetEncoder(input_dim, args.hidden_dim, args.output_dim, 2,
-                args.num_gc_layers, bn=args.bn).cuda()
-    else:
-        print('Method: base')
-        model = encoders.GcnEncoderGraph(input_dim, args.hidden_dim, args.output_dim, 2,
-                args.num_gc_layers, bn=args.bn).cuda()
-
-    train(train_dataset, model, args, val_dataset=val_dataset, test_dataset=test_dataset,
-            writer=writer)
-
-def syn_community2hier(args, writer=None):
-
-    # data
-    feat_gen = [featgen.ConstFeatureGen(np.ones(args.input_dim, dtype=float))]
-    graphs1 = datagen.gen_2hier(1000, [2,4], 10, range(4,5), 0.1, 0.03, feat_gen)
-    graphs2 = datagen.gen_2hier(1000, [3,3], 10, range(4,5), 0.1, 0.03, feat_gen)
-    graphs3 = datagen.gen_2community_ba(range(28, 33), range(4,7), 1000, 0.25, feat_gen)
-
-    for G in graphs1:
-        G.graph['label'] = 0
-    for G in graphs2:
-        G.graph['label'] = 1
-    for G in graphs3:
-        G.graph['label'] = 2
-
-    graphs = graphs1 + graphs2 + graphs3
-
-    train_dataset, val_dataset, test_dataset, max_num_nodes, input_dim, assign_input_dim = prepare_data(graphs, args)
-
-    if args.method == 'soft-assign':
-        print('Method: soft-assign')
-        model = encoders.SoftPoolingGcnEncoder(
-                max_num_nodes, 
-                input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
-                args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
-                bn=args.bn, linkpred=args.linkpred, args=args, assign_input_dim=assign_input_dim).cuda()
-    elif args.method == 'base-set2set':
-        print('Method: base-set2set')
-        model = encoders.GcnSet2SetEncoder(input_dim, args.hidden_dim, args.output_dim, 2,
-                args.num_gc_layers, bn=args.bn, args=args, assign_input_dim=assign_input_dim).cuda()
-    else:
-        print('Method: base')
-        model = encoders.GcnEncoderGraph(input_dim, args.hidden_dim, args.output_dim, 2,
-                args.num_gc_layers, bn=args.bn, args=args).cuda()
-    train(train_dataset, model, args, val_dataset=val_dataset, test_dataset=test_dataset,
-            writer=writer)
-
-
-def pkl_task(args, feat=None):
-    with open(os.path.join(args.datadir, args.pkl_fname), 'rb') as pkl_file:
-        data = pickle.load(pkl_file)
-    graphs = data[0]
-    labels = data[1]
-    test_graphs = data[2]
-    test_labels = data[3]
-
-    for i in range(len(graphs)):
-        graphs[i].graph['label'] = labels[i]
-    for i in range(len(test_graphs)):
-        test_graphs[i].graph['label'] = test_labels[i]
-
-    if feat is None:
-        featgen_const = featgen.ConstFeatureGen(np.ones(args.input_dim, dtype=float))
-        for G in graphs:
-            featgen_const.gen_node_features(G)
-        for G in test_graphs:
-            featgen_const.gen_node_features(G)
-
-    train_dataset, test_dataset, max_num_nodes = prepare_data(graphs, args, test_graphs=test_graphs)
-    model = encoders.GcnEncoderGraph(
-            args.input_dim, args.hidden_dim, args.output_dim, args.num_classes, 
-            args.num_gc_layers, bn=args.bn).cuda()
-    train(train_dataset, model, args, test_dataset=test_dataset)
-    evaluate(test_dataset, model, args, 'Validation')
-
-def benchmark_task(args, writer=None, feat='node-label'):
-    graphs = load_data.read_graphfile(args.datadir, args.bmname, max_nodes=args.max_nodes)
-    
-    if feat == 'node-feat' and 'feat_dim' in graphs[0].graph:
-        print('Using node features')
-        input_dim = graphs[0].graph['feat_dim']
-    elif feat == 'node-label' and 'label' in graphs[0].node[0]:
-        print('Using node labels')
-        for G in graphs:
-            for u in G.nodes():
-                G.node[u]['feat'] = np.array(G.node[u]['label'])
-    else:
-        print('Using constant labels')
-        featgen_const = featgen.ConstFeatureGen(np.ones(args.input_dim, dtype=float))
-        for G in graphs:
-            featgen_const.gen_node_features(G)
-
-    train_dataset, val_dataset, test_dataset, max_num_nodes, input_dim, assign_input_dim = \
-            prepare_data(graphs, args, max_nodes=args.max_nodes)
-    if args.method == 'soft-assign':
-        print('Method: soft-assign')
-        model = encoders.SoftPoolingGcnEncoder(
-                max_num_nodes, 
-                input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
-                args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
-                bn=args.bn, dropout=args.dropout, linkpred=args.linkpred, args=args,
-                assign_input_dim=assign_input_dim).cuda()
-    elif args.method == 'base-set2set':
-        print('Method: base-set2set')
-        model = encoders.GcnSet2SetEncoder(
-                input_dim, args.hidden_dim, args.output_dim, args.num_classes,
-                args.num_gc_layers, bn=args.bn, dropout=args.dropout, args=args).cuda()
-    else:
-        print('Method: base')
-        model = encoders.GcnEncoderGraph(
-                input_dim, args.hidden_dim, args.output_dim, args.num_classes, 
-                args.num_gc_layers, bn=args.bn, dropout=args.dropout, args=args).cuda()
-
-    train(train_dataset, model, args, val_dataset=val_dataset, test_dataset=test_dataset,
-            writer=writer)
-    evaluate(test_dataset, model, args, 'Validation')
-
+    for i in range(2):
+        val_accs = train_node_task(adj, features, model, args, labels, dataset_idx, writer=writer)
+        all_vals.append(val_accs['acc'])
+    print(all_vals)
+    print(np.mean(all_vals))
+    print(np.std(all_vals))
 
 def benchmark_task_val(args, writer=None, feat='node-label'):
     all_vals = []
-    graphs = load_data.read_graphfile(args.datadir, args.bmname, max_nodes=args.max_nodes)
-    
+    graphs = process.read_graphfile(args.datadir, args.bmname, max_nodes=args.max_nodes)
+    #graphs = load_data.read_moleculefile(args.datadir, args.bmname, max_nodes=args.max_nodes)
+
     if feat == 'node-feat' and 'feat_dim' in graphs[0].graph:
         print('Using node features')
         input_dim = graphs[0].graph['feat_dim']
@@ -555,27 +505,17 @@ def benchmark_task_val(args, writer=None, feat='node-label'):
          
     for i in range(10):
         train_dataset, val_dataset, max_num_nodes, input_dim, assign_input_dim = \
-                cross_val.prepare_val_data(graphs, args, i, max_nodes=args.max_nodes)
-        if args.method == 'soft-assign':
-            print('Method: soft-assign')
-            model = encoders.SoftPoolingGcnEncoder(
-                    max_num_nodes, 
-                    input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
-                    args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
-                    bn=args.bn, dropout=args.dropout, linkpred=args.linkpred, args=args,
-                    assign_input_dim=assign_input_dim).cuda()
-        elif args.method == 'base-set2set':
-            print('Method: base-set2set')
-            model = encoders.GcnSet2SetEncoder(
-                    input_dim, args.hidden_dim, args.output_dim, args.num_classes,
-                    args.num_gc_layers, bn=args.bn, dropout=args.dropout, args=args).cuda()
-        else:
-            print('Method: base')
-            model = encoders.GcnEncoderGraph(
-                    input_dim, args.hidden_dim, args.output_dim, args.num_classes, 
-                    args.num_gc_layers, bn=args.bn, dropout=args.dropout, args=args).cuda()
+                process.prepare_graph_task(graphs, args, i, max_nodes=args.max_nodes)
 
-        _, val_accs = train(train_dataset, model, args, val_dataset=val_dataset, test_dataset=None,
+        model = encoders.SoftPoolingGcnEncoder(
+                args.encoder,               
+                max_num_nodes, 
+                input_dim, args.hidden_dim, args.output_dim, args.num_classes, args.num_gc_layers,
+                args.hidden_dim, assign_ratio=args.assign_ratio, num_pooling=args.num_pool,
+                bn=args.bn, dropout=args.dropout, linkpred=args.linkpred, args=args,
+                assign_input_dim=assign_input_dim).cuda()
+   
+        val_accs = train_graph_task(train_dataset, model, args, val_dataset=val_dataset, test_dataset=None,
             writer=writer)
         all_vals.append(np.array(val_accs))
     all_vals = np.vstack(all_vals)
@@ -591,20 +531,23 @@ def arg_parse():
     io_parser.add_argument('--dataset', dest='dataset', 
             help='Input dataset.')
     benchmark_parser = io_parser.add_argument_group()
+    benchmark_parser.add_argument('--task', dest='task',
+            help='Task. Possible values: node, graph')    
     benchmark_parser.add_argument('--bmname', dest='bmname',
             help='Name of the benchmark dataset')
     io_parser.add_argument('--pkl', dest='pkl_fname',
             help='Name of the pkl data file')
 
-    softpool_parser = parser.add_argument_group()
-    softpool_parser.add_argument('--assign-ratio', dest='assign_ratio', type=float,
+    model_parser = parser.add_argument_group()
+    model_parser.add_argument('--encoder', dest='encoder',
+            help='Encoder. Possible values: GCN, GAT')     
+    model_parser.add_argument('--assign-ratio', dest='assign_ratio', type=float,
             help='ratio of number of nodes in consecutive layers')
-    softpool_parser.add_argument('--num-pool', dest='num_pool', type=int,
+    model_parser.add_argument('--num-pool', dest='num_pool', type=int,
             help='number of pooling layers')
     parser.add_argument('--linkpred', dest='linkpred', action='store_const',
             const=True, default=False,
             help='Whether link prediction side objective is used')
-
 
     parser.add_argument('--datadir', dest='datadir',
             help='Directory where benchmark is located')
@@ -647,14 +590,13 @@ def arg_parse():
             const=False, default=True,
             help='Whether to add bias. Default to True.')
 
-    parser.add_argument('--method', dest='method',
-            help='Method. Possible values: base, base-set2set, soft-assign')
     parser.add_argument('--name-suffix', dest='name_suffix',
             help='suffix added to the output filename')
 
     parser.set_defaults(datadir='data',
                         logdir='log',
-                        dataset='syn1v2',
+                        task='node',
+                        dataset='DD',
                         max_nodes=1000,
                         cuda='1',
                         feature_type='default',
@@ -666,13 +608,13 @@ def arg_parse():
                         test_ratio=0.1,
                         num_workers=1,
                         input_dim=10,
-                        hidden_dim=20,
-                        output_dim=20,
+                        hidden_dim=128,
+                        output_dim=128,
                         num_classes=2,
                         num_gc_layers=3,
                         dropout=0.0,
-                        method='base',
                         name_suffix='',
+                        encoder='GCN',
                         assign_ratio=0.1,
                         num_pool=1
                        )
@@ -691,18 +633,17 @@ def main():
 
     os.environ['CUDA_VISIBLE_DEVICES'] = prog_args.cuda
     print('CUDA', prog_args.cuda)
-
-    if prog_args.bmname is not None:
+    
+    if prog_args.task == 'graph':
         benchmark_task_val(prog_args, writer=writer)
-    elif prog_args.pkl_fname is not None:
-        pkl_task(prog_args)
-    elif prog_args.dataset is not None:
-        if prog_args.dataset == 'syn1v2':
-            syn_community1v2(prog_args, writer=writer)
-        if prog_args.dataset == 'syn2hier':
-            syn_community2hier(prog_args, writer=writer)
-
-    writer.close()
+        writer.close()
+    elif prog_args.task == 'node':
+        node_benchmark_task(prog_args, writer=writer)
+        writer.close()
+    else:
+        print('Unrecognized task argument.')
+        writer.close()
+        exit()
 
 if __name__ == "__main__":
     main()

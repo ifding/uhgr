@@ -96,6 +96,7 @@ class GraphSampler(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         adj = self.adj_all[idx]
+        
         num_nodes = adj.shape[0]
         adj_padded = np.zeros((self.max_num_nodes, self.max_num_nodes))
         adj_padded[:num_nodes, :num_nodes] = adj
@@ -103,6 +104,7 @@ class GraphSampler(torch.utils.data.Dataset):
         fts = np.random.permutation(num_nodes)
         padd = np.arange(num_nodes, self.max_num_nodes)
         shuf_idx = np.concatenate((fts, padd))
+
         shuf_fts = self.feature_all[idx].copy()[shuf_idx, :]
 
         # use all nodes for aggregation (baseline)
