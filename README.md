@@ -1,10 +1,11 @@
 # Unsupervised Hierarchical Graph Representation Learning
 
-
-Some Requirements:
+Requirements:
 
 pytorch>=0.41
+
 tensorboardX==1.2
+
 networkx==2.2
 
 ## Data set for Graph Classification
@@ -21,4 +22,6 @@ I uses the D&D data set as an example, for other datasets, they can be directly 
 
 ## Train model
 
-To train the model, just run: ./example.sh
+To train the model, just run: 
+
+./example.sh
