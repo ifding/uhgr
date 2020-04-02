@@ -3,7 +3,7 @@
 
 Some Requirements:
 
-pytorch==0.41
+pytorch>=0.41
 tensorboardX==1.2
 networkx==2.2
 

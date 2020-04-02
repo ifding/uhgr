@@ -380,7 +380,7 @@ def train_graph_task(dataset, model, args, same_feat=True, val_dataset=None, tes
     model.load_state_dict(torch.load('best_dgi.pkl')) 
     
        
-    classifier = Classifier(args.hidden_dim*3, [], args.num_classes)
+    classifier = Classifier(args.hidden_dim*6, [], args.num_classes)
     xent = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(classifier.parameters(), lr=0.01, weight_decay=0.0)
     classifier.cuda() 
@@ -614,7 +614,7 @@ def arg_parse():
                         num_gc_layers=3,
                         dropout=0.0,
                         name_suffix='',
-                        encoder='GCN',
+                        encoder='GAT', #GCN
                         assign_ratio=0.1,
                         num_pool=1
                        )
